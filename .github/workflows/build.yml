@@ -143,17 +143,50 @@ jobs:
           done
           ls -la; df -h /System/Volumes/Data | tail -1
 
-      - name: Build IPA
+      - name: Space check
         if: inputs.mode == 'build'
         run: |
+          # the peak, with the NSPs deleted once extracted: NSPs + their extraction + 6 GB as the extraction ends, or extraction + shaders + an IPA as large as the extraction as it is packed
+          G="$RUNNER_TEMP/Games/game"; nsp=$(stat -f %z "$G"/*.nsp | awk '{s += $1} END {print int(s / 1073741824 + 0.5)}')
+          free=$(df -g /System/Volumes/Data | awk 'NR==2{print $4}'); need=$((nsp * 2 + 14))
+          echo "NSPs $nsp GB, free $free GB, need $need GB"
+          [ "$free" -ge "$need" ] || { echo "::error::$free GB free, the build needs about $need GB"; exit 1; }
+
+      - name: Build IPA
+        if: inputs.mode == 'build'
+        env:
+          STATUS_URL: ${{ secrets[format('STATUS_URL_{0}', inputs.game)] }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          set -o pipefail
+          G="$RUNNER_TEMP/Games/game"; LOG="$RUNNER_TEMP/build.log"; : > "$LOG"
+          # beside the build: the base and update NSPs deleted once the rewrite has started (the extraction and the DLC step are done; nothing reads them after), and
+          # every 5 minutes the free space and the last progress line put to a private S3 object, since a running job's log cannot be read
+          (
+            gone=""
+            while sleep 60; do
+              if [ -z "$gone" ] && ls "$G"/*_build/logs/rewrite_*.log >/dev/null 2>&1 && ! ls -d "$G"/*_build/extract/*.partial >/dev/null 2>&1; then
+                for f in "$G"/*.nsp; do echo "$f" | grep -Eq '\[[0-9A-Fa-f]{13}(000|800)\]' && rm -f "$f" && echo "deleted $(basename "$f") (extracted)"; done; gone=1
+              fi
+              if [ -n "$STATUS_URL" ] && [ $(( $(date +%s) / 60 % 5 )) = 0 ]; then
+                { date -u; df -h /System/Volumes/Data | tail -1; tail -c 2000 "$LOG" | tr '\r' '\n' | grep -a . | tail -3; } > "$RUNNER_TEMP/status.txt"
+                curl -fsS -T "$RUNNER_TEMP/status.txt" "$STATUS_URL" || true
+              fi
+            done
+          ) &
+          WATCH=$!
           cd "$RUNNER_TEMP/nxnative"
           EXTRA=""; if [ "${{ inputs.allow_other_metal }}" = "true" ]; then EXTRA="--allow-other-metal"; fi
-          "$RUNNER_TEMP/venv/bin/python" scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/Games/game" -k "$RUNNER_TEMP/keys/prod.keys" $EXTRA
+          rc=0; "$RUNNER_TEMP/venv/bin/python" scripts/build_ipa_from_nsp.py "$G" -k "$RUNNER_TEMP/keys/prod.keys" --progress lines $EXTRA 2>&1 | tee "$LOG" || rc=$?
+          kill $WATCH 2>/dev/null || true
+          { date -u; df -h /System/Volumes/Data | tail -1; echo "build exit $rc"; tail -3 "$LOG"; } > "$RUNNER_TEMP/status.txt"; [ -z "$STATUS_URL" ] || curl -fsS -T "$RUNNER_TEMP/status.txt" "$STATUS_URL" || true
+          df -h /System/Volumes/Data | tail -1; exit $rc
 
       - name: Upload IPA
         if: inputs.mode == 'build'
         env:
           PUT_URLS: ${{ secrets[format('IPA_PUT_URLS_{0}', inputs.game)] }}
+          STATUS_URL: ${{ secrets[format('STATUS_URL_{0}', inputs.game)] }}
         run: |
           rm -f "$RUNNER_TEMP/keys/prod.keys"
           IPA=$(ls "$RUNNER_TEMP/Games/game"/*.ipa | head -1); ls -la "$IPA"
@@ -165,6 +198,8 @@ jobs:
           cd "$RUNNER_TEMP"; split -b 1000m "$IPA" ipa_part_
           i=0; for p in ipa_part_*; do i=$((i+1)); curl -fsS --retry 5 -T "$p" "$(printf '%s\n' "$PUT_URLS" | tr -d '\r' | sed -n "${i}p")"; rm -f "$p"; done
           echo "uploaded $(basename "$IPA") in $i parts"
+          { date -u; echo "uploaded $(basename "$IPA") ($(stat -f %z "$IPA") bytes) in $i parts"; } > "$RUNNER_TEMP/status.txt"
+          [ -z "$STATUS_URL" ] || curl -fsS -T "$RUNNER_TEMP/status.txt" "$STATUS_URL" || true
 
       - name: Keep logs
         if: always() && inputs.mode == 'build'
