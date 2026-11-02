@@ -1,0 +1,110 @@
+name: build-ipa
+# Builds an nxnative IPA on a GitHub Apple silicon runner. The game and prod.keys are never in this repo:
+# they come from private, expiring S3 links in the GAME_URL / KEYS_URL secrets, and the IPA goes back the same way (IPA_PUT_URLS).
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: probe (machine info only) or build
+        type: choice
+        options: [probe, build]
+        default: probe
+      runner:
+        description: runner image
+        type: string
+        default: macos-26
+      game_file:
+        description: NSP file name on the runner
+        type: string
+        default: Super Mario Bros. Wonder [010015100B514000].nsp
+      allow_other_metal:
+        description: build with this image's Metal compiler if Xcode 27.1 is missing (pictures may render wrong)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  run:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 345
+    steps:
+      - name: Machine
+        run: |
+          sw_vers; uname -m; sysctl -n machdep.cpu.brand_string; echo "cores $(sysctl -n hw.ncpu), RAM $(( $(sysctl -n hw.memsize) / 1073741824 )) GB"
+          df -h / "$RUNNER_TEMP" || true
+          ls -d /Applications/Xcode*.app || true
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version || echo "no iOS SDK"
+          xcrun -sdk iphoneos metal --version || echo "no Metal toolchain"
+          dotnet --list-sdks || echo "no dotnet"
+          which -a python3; python3 --version
+
+      - name: Select Xcode
+        if: inputs.mode == 'build'
+        run: |
+          X=$(ls -d /Applications/Xcode_27.1*.app 2>/dev/null | head -1)
+          if [ -z "$X" ]; then
+            echo "::warning::Xcode 27.1 is not on this image"
+            X=$(ls -d /Applications/Xcode_27*.app 2>/dev/null | sort -V | tail -1)
+          fi
+          sudo xcode-select -s "$X"; xcodebuild -version
+          xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
+          xcrun --sdk iphoneos --show-sdk-version || sudo xcodebuild -downloadPlatform iOS
+
+      - uses: actions/setup-dotnet@v4
+        if: inputs.mode == 'build'
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Tools
+        if: inputs.mode == 'build'
+        run: |
+          brew install xcodegen zstd glslang python@3.13
+          PY=/opt/homebrew/bin/python3.13; file "$PY"; "$PY" --version
+          "$PY" -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q lz4 capstone fonttools nsz zbic "backports.zstd; python_version < '3.14'"
+          git clone --depth 1 https://github.com/seedds/nxnative.git "$RUNNER_TEMP/nxnative"
+          git -C "$RUNNER_TEMP/nxnative" log -1 --format='nxnative %h %cs %s'
+
+      - name: Get game
+        if: inputs.mode == 'build'
+        env:
+          GAME_URL: ${{ secrets.GAME_URL }}
+          KEYS_URL: ${{ secrets.KEYS_URL }}
+          GAME_FILE: ${{ inputs.game_file }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/Games/game" "$RUNNER_TEMP/keys"
+          curl -fsS -o "$RUNNER_TEMP/keys/prod.keys" "$KEYS_URL"
+          curl -fsS -o "$RUNNER_TEMP/Games/game/$GAME_FILE" "$GAME_URL"
+          ls -la "$RUNNER_TEMP/Games/game"; df -h "$RUNNER_TEMP"
+
+      - name: Build IPA
+        if: inputs.mode == 'build'
+        run: |
+          cd "$RUNNER_TEMP/nxnative"
+          EXTRA=""; if [ "${{ inputs.allow_other_metal }}" = "true" ]; then EXTRA="--allow-other-metal"; fi
+          "$RUNNER_TEMP/venv/bin/python" scripts/build_ipa_from_nsp.py "$RUNNER_TEMP/Games/game" -k "$RUNNER_TEMP/keys/prod.keys" $EXTRA
+          rm -f "$RUNNER_TEMP/keys/prod.keys"
+
+      - name: Upload IPA
+        if: inputs.mode == 'build'
+        env:
+          PUT_URLS: ${{ secrets.IPA_PUT_URLS }}
+        run: |
+          IPA=$(ls "$RUNNER_TEMP/Games/game"/*.ipa | head -1); ls -la "$IPA"
+          cd "$RUNNER_TEMP"; split -b 1000m "$IPA" ipa_part_
+          i=0; for p in ipa_part_*; do i=$((i+1)); curl -fsS -T "$p" "$(echo "$PUT_URLS" | sed -n "${i}p")"; done
+          echo "uploaded $(basename "$IPA") in $i parts"
+
+      - name: Keep logs
+        if: always() && inputs.mode == 'build'
+        run: |
+          rm -f "$RUNNER_TEMP/keys/prod.keys"
+          cd "$RUNNER_TEMP/Games/game" && tar czf "$RUNNER_TEMP/logs.tgz" */logs */*_survey 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.mode == 'build'
+        with:
+          name: build-logs
+          path: ${{ runner.temp }}/logs.tgz
+          retention-days: 3
+          if-no-files-found: ignore
