@@ -88,6 +88,15 @@ jobs:
           curl -fsS --retry 3 -o "$RUNNER_TEMP/Games/game/${{ inputs.game }}.nsp" "$GAME_URL"
           ls -la "$RUNNER_TEMP/Games/game"; df -h "$RUNNER_TEMP"
 
+      - name: Check upload links
+        if: inputs.mode == 'build'
+        env:
+          PUT_URLS: ${{ secrets[format('IPA_PUT_URLS_{0}', inputs.game)] }}
+        run: |
+          # before the long build: every link one line, https, no stray carriage return
+          n=$(printf '%s\n' "$PUT_URLS" | tr -d '\r' | grep -c '^https://' || true)
+          echo "$n upload links"; [ "$n" -ge 8 ] || { echo "::error::IPA_PUT_URLS_${{ inputs.game }} has $n usable links"; exit 1; }
+
       - name: Build IPA
         if: inputs.mode == 'build'
         run: |
@@ -103,7 +112,7 @@ jobs:
           rm -f "$RUNNER_TEMP/keys/prod.keys"
           IPA=$(ls "$RUNNER_TEMP/Games/game"/*.ipa | head -1); ls -la "$IPA"
           cd "$RUNNER_TEMP"; split -b 1000m "$IPA" ipa_part_
-          i=0; for p in ipa_part_*; do i=$((i+1)); curl -fsS --retry 3 -T "$p" "$(echo "$PUT_URLS" | sed -n "${i}p")"; done
+          i=0; for p in ipa_part_*; do i=$((i+1)); curl -fsS --retry 5 -T "$p" "$(printf '%s\n' "$PUT_URLS" | tr -d '\r' | sed -n "${i}p")"; done
           echo "uploaded $(basename "$IPA") in $i parts"
 
       - name: Keep logs
