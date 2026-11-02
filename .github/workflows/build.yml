@@ -12,7 +12,7 @@ on:
       game:
         description: which game
         type: choice
-        options: [WONDER, MK8D, ODYSSEY, NSMBUD]
+        options: [WONDER, MK8D, BOTW, ODYSSEY, NSMBUD]
         default: WONDER
       runner:
         description: runner image
