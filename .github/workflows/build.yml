@@ -87,7 +87,15 @@ jobs:
             [ "$(cd "$X" && pwd -P)" = "$KEEP" ] && continue
             sudo rm -rf "$X" && echo "removed $X"
           done
-          df -h / | tail -1
+          df -h /System/Volumes/Data | tail -1
+          # then the simulators, the Android SDK and the toolcaches this build does not use (Python stays: setup-python's 3.13 is in it)
+          xcrun simctl shutdown all 2>/dev/null || true
+          xcrun simctl runtime delete all 2>/dev/null || true
+          xcrun simctl delete all 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* ~/Library/Developer/CoreSimulator/* ~/Library/Developer/Xcode/iOS\ DeviceSupport 2>/dev/null || true
+          sudo rm -rf ~/Library/Android /usr/local/share/android-sdk /usr/local/lib/android ~/.android ~/.ghcup ~/.rustup ~/.cargo 2>/dev/null || true
+          for T in "$RUNNER_TOOL_CACHE"/*; do case "$(basename "$T")" in Python) ;; *) sudo rm -rf "$T" && echo "removed $T";; esac; done
+          df -h /System/Volumes/Data | tail -1
 
       - name: Get game
         if: inputs.mode == 'build'
@@ -121,6 +129,20 @@ jobs:
           n=$(printf '%s\n' "$PUT_URLS" | tr -d '\r' | grep -c '^https://' || true)
           echo "$n upload links"; [ "$n" -ge 8 ] || { echo "::error::IPA_PUT_URLS_${{ inputs.game }} has $n usable links"; exit 1; }
 
+      - name: Decompress NSZ
+        if: inputs.mode == 'build'
+        run: |
+          # as the script's own nsz -D, but each NSZ is deleted once its NSP is whole: the compressed copies are not on disk through the build
+          cd "$RUNNER_TEMP/Games/game"
+          for Z in *.nsz; do
+            [ -e "$Z" ] || continue
+            T="$RUNNER_TEMP/nsz_tmp"; rm -rf "$T"; mkdir -p "$T"; ln -s "$RUNNER_TEMP/keys/prod.keys" "$T/keys.txt"
+            (cd "$T" && "$RUNNER_TEMP/venv/bin/python" -c "import sys; sys.argv[0] = 'nsz'; from nsz import main; main()" -D -o "$T" "$RUNNER_TEMP/Games/game/$Z")
+            N="${Z%.nsz}.nsp"; [ -s "$T/$N" ] || { echo "::error::nsz made no $N"; exit 1; }
+            mv "$T/$N" "$N" && rm -f "$Z" && echo "decompressed $Z"; rm -rf "$T"
+          done
+          ls -la; df -h /System/Volumes/Data | tail -1
+
       - name: Build IPA
         if: inputs.mode == 'build'
         run: |
@@ -135,14 +157,20 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP/keys/prod.keys"
           IPA=$(ls "$RUNNER_TEMP/Games/game"/*.ipa | head -1); ls -la "$IPA"
+          # the work folder and the game files are not needed now, and the parts need as much room as the IPA: keep the logs, delete the rest
+          cd "$RUNNER_TEMP/Games/game" && tar czf "$RUNNER_TEMP/logs.tgz" *_build/logs *_survey 2>/dev/null || true
+          rm -rf "$RUNNER_TEMP/Games/game"/*_build "$RUNNER_TEMP/Games/game"/*.nsp "$RUNNER_TEMP/Games/game"/*.nsz; df -h /System/Volumes/Data | tail -1
+          n=$(printf '%s\n' "$PUT_URLS" | tr -d '\r' | grep -c '^https://' || true); need=$(( ($(stat -f %z "$IPA") + 1048575999) / 1048576000 ))
+          echo "$need parts, $n links"; [ "$need" -le "$n" ] || { echo "::error::the IPA needs $need parts and there are $n upload links"; exit 1; }
           cd "$RUNNER_TEMP"; split -b 1000m "$IPA" ipa_part_
-          i=0; for p in ipa_part_*; do i=$((i+1)); curl -fsS --retry 5 -T "$p" "$(printf '%s\n' "$PUT_URLS" | tr -d '\r' | sed -n "${i}p")"; done
+          i=0; for p in ipa_part_*; do i=$((i+1)); curl -fsS --retry 5 -T "$p" "$(printf '%s\n' "$PUT_URLS" | tr -d '\r' | sed -n "${i}p")"; rm -f "$p"; done
           echo "uploaded $(basename "$IPA") in $i parts"
 
       - name: Keep logs
         if: always() && inputs.mode == 'build'
         run: |
           rm -f "$RUNNER_TEMP/keys/prod.keys"
+          [ -s "$RUNNER_TEMP/logs.tgz" ] && exit 0   # Upload IPA kept them before deleting the work folder
           cd "$RUNNER_TEMP/Games/game" 2>/dev/null && tar czf "$RUNNER_TEMP/logs.tgz" *_build/logs *_survey 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         if: always() && inputs.mode == 'build'
