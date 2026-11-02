@@ -40,13 +40,28 @@ jobs:
           xcrun -sdk iphoneos metal --version || echo "no Metal toolchain"
           dotnet --list-sdks || echo "no dotnet"
 
+      - name: Get nxnative
+        if: inputs.mode == 'build'
+        run: |
+          git clone --depth 1 https://github.com/seedds/nxnative.git "$RUNNER_TEMP/nxnative"
+          git -C "$RUNNER_TEMP/nxnative" log -1 --format='nxnative %h %cs %s'
+
       - name: Select Xcode
         if: inputs.mode == 'build'
         run: |
-          X=$(ls -d /Applications/Xcode_27.1.app 2>/dev/null | head -1)
-          if [ -z "$X" ]; then echo "::warning::Xcode 27.1 is not on this image"; X=$(ls -d /Applications/Xcode_27*.app | sort -V | tail -1); fi
-          sudo xcode-select -s "$X"; xcodebuild -version
-          xcrun -sdk iphoneos metal --version || xcodebuild -downloadComponent MetalToolchain
+          # the Xcode whose Metal compiler is the one nxnative's shader chain is locked to (dm/gfx/tools/dmsh_chain.lock)
+          WANT=$(awk -F'\t' '$1=="metal_iphoneos"{print $2}' "$RUNNER_TEMP/nxnative/dm/gfx/tools/dmsh_chain.lock"); echo "wanted: $WANT"
+          PICK=""
+          for X in $(ls -d /Applications/Xcode_27*.app | sort -rV); do
+            [ -L "$X" ] && continue
+            sudo xcode-select -s "$X"
+            HAVE=$(xcrun -sdk iphoneos metal --version 2>/dev/null | head -1)
+            if [ -z "$HAVE" ]; then xcodebuild -downloadComponent MetalToolchain >/dev/null 2>&1 || true; HAVE=$(xcrun -sdk iphoneos metal --version 2>/dev/null | head -1); fi
+            echo "$X: $HAVE"
+            if [ "$HAVE" = "$WANT" ]; then PICK=$X; break; fi
+          done
+          if [ -z "$PICK" ]; then echo "::warning::no Xcode here has $WANT"; PICK=$(ls -d /Applications/Xcode_27*.app | sort -V | tail -1); fi
+          sudo xcode-select -s "$PICK"; xcodebuild -version; xcrun -sdk iphoneos metal --version | head -1
           xcrun --sdk iphoneos --show-sdk-version || sudo xcodebuild -downloadPlatform iOS
 
       - uses: actions/setup-python@v5
@@ -61,8 +76,6 @@ jobs:
           python3 -c "import platform, sys; print(sys.version, platform.machine())"
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -q lz4 capstone fonttools nsz zbic "backports.zstd; python_version < '3.14'"
-          git clone --depth 1 https://github.com/seedds/nxnative.git "$RUNNER_TEMP/nxnative"
-          git -C "$RUNNER_TEMP/nxnative" log -1 --format='nxnative %h %cs %s'
 
       - name: Get game
         if: inputs.mode == 'build'
