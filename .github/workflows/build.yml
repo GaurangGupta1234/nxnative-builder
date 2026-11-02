@@ -77,15 +77,36 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install -q lz4 capstone fonttools nsz zbic "backports.zstd; python_version < '3.14'"
 
+      - name: Free disk
+        if: inputs.mode == 'build'
+        run: |
+          # every Xcode but the selected one (each is many GB); a bigger game needs about twice its size plus 10 GB
+          KEEP=$(cd "$(xcode-select -p)/../.." && pwd -P); echo "keeping $KEEP"; df -h / | tail -1
+          for X in /Applications/Xcode*.app; do
+            [ -L "$X" ] && continue
+            [ "$(cd "$X" && pwd -P)" = "$KEEP" ] && continue
+            sudo rm -rf "$X" && echo "removed $X"
+          done
+          df -h / | tail -1
+
       - name: Get game
         if: inputs.mode == 'build'
         env:
           GAME_URL: ${{ secrets[format('GAME_URL_{0}', inputs.game)] }}
+          GAME_FILES: ${{ secrets[format('GAME_FILES_{0}', inputs.game)] }}
           KEYS_URL: ${{ secrets.KEYS_URL }}
         run: |
           mkdir -p "$RUNNER_TEMP/Games/game" "$RUNNER_TEMP/keys"
           curl -fsS --retry 3 -o "$RUNNER_TEMP/keys/prod.keys" "$KEYS_URL"
-          curl -fsS --retry 3 -o "$RUNNER_TEMP/Games/game/${{ inputs.game }}.nsp" "$GAME_URL"
+          if [ -n "$GAME_FILES" ]; then
+            # one line per file: <file name> TAB <link>; the name carries [title ID][version] for the script
+            printf '%s\n' "$GAME_FILES" | tr -d '\r' | while IFS=$'\t' read -r name url; do
+              [ -n "$url" ] || continue
+              echo "downloading $name"; curl -fsS --retry 3 -o "$RUNNER_TEMP/Games/game/$name" "$url"
+            done
+          else
+            curl -fsS --retry 3 -o "$RUNNER_TEMP/Games/game/${{ inputs.game }}.nsp" "$GAME_URL"
+          fi
           ls -la "$RUNNER_TEMP/Games/game"; df -h "$RUNNER_TEMP"
 
       - name: Check upload links
